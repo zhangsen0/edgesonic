@@ -1,0 +1,263 @@
+name: Deploy EdgeSonic to Cloudflare
+
+# Builds the monorepo from source and ships the Worker + Vue frontend to
+# Cloudflare, then syncs the Worker secrets and restores the hourly cron
+# trigger that `wrangler deploy` clears.
+#
+# Repository secrets (Settings -> Secrets and variables -> Actions):
+#   CLOUDFLARE_API_TOKEN   token with Workers Scripts:Edit + D1:Edit + R2:Edit
+#   CLOUDFLARE_ACCOUNT_ID  Cloudflare account id
+#   WORK_UPLOAD_HMAC_KEY   HMAC-SHA-256 key for browser-pool upload tokens
+#   CF_API_TOKEN           same token, bound to the Worker as CF_API_TOKEN
+#   R2_ACCESS_KEY_ID       = the token id
+#   R2_SECRET_ACCESS_KEY   = SHA-256 hex of the token value
+#
+# Repository variables:
+#   EDGESONIC_WORKER_NAME, EDGESONIC_D1_DATABASE_NAME, EDGESONIC_D1_DATABASE_ID,
+#   EDGESONIC_R2_BUCKET, EDGESONIC_DOMAIN, EDGESONIC_INSTANCE_ID
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never run two deploys at once: wrangler deploy + secret sync must not
+# interleave, otherwise a stale version can win the race at the edge.
+concurrency:
+  group: edgesonic-cloudflare-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Build & deploy Worker
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # Prefixed so the Worker-bound values are not confused with the
+      # deployment credentials when reading this file.
+      S_WORK_HMAC: ${{ secrets.WORK_UPLOAD_HMAC_KEY }}
+      S_CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      S_R2_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      S_R2_SECRET: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      WORKER_NAME: ${{ vars.EDGESONIC_WORKER_NAME }}
+      DB_NAME: ${{ vars.EDGESONIC_D1_DATABASE_NAME }}
+      DB_ID: ${{ vars.EDGESONIC_D1_DATABASE_ID }}
+      R2_BUCKET: ${{ vars.EDGESONIC_R2_BUCKET }}
+      SITE_DOMAIN: ${{ vars.EDGESONIC_DOMAIN }}
+      INSTANCE_ID: ${{ vars.EDGESONIC_INSTANCE_ID }}
+
+    steps:
+      - name: Check required secrets and variables
+        run: |
+          set -euo pipefail
+          missing=0
+          for pair in \
+            "CLOUDFLARE_API_TOKEN=$CLOUDFLARE_API_TOKEN" \
+            "CLOUDFLARE_ACCOUNT_ID=$CLOUDFLARE_ACCOUNT_ID" \
+            "WORK_UPLOAD_HMAC_KEY=$S_WORK_HMAC" \
+            "CF_API_TOKEN=$S_CF_API_TOKEN" \
+            "R2_ACCESS_KEY_ID=$S_R2_KEY_ID" \
+            "R2_SECRET_ACCESS_KEY=$S_R2_SECRET" \
+            "vars.EDGESONIC_WORKER_NAME=$WORKER_NAME" \
+            "vars.EDGESONIC_D1_DATABASE_NAME=$DB_NAME" \
+            "vars.EDGESONIC_D1_DATABASE_ID=$DB_ID" \
+            "vars.EDGESONIC_R2_BUCKET=$R2_BUCKET" \
+            "vars.EDGESONIC_DOMAIN=$SITE_DOMAIN" \
+            "vars.EDGESONIC_INSTANCE_ID=$INSTANCE_ID" ; do
+            name="${pair%%=*}"
+            if [ -z "${pair#*=}" ]; then
+              echo "::error::Missing $name"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "All required configuration is present."
+
+      - name: Mask sensitive values
+        run: |
+          echo "::add-mask::${{ secrets.CLOUDFLARE_API_TOKEN }}"
+          echo "::add-mask::${{ secrets.WORK_UPLOAD_HMAC_KEY }}"
+          echo "::add-mask::${{ secrets.R2_SECRET_ACCESS_KEY }}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: |
+          set -euo pipefail
+          npm run build:web
+          test -s web/dist/build-info.json
+
+      - name: Generate worker/wrangler.toml
+        run: |
+          set -euo pipefail
+          # worker/wrangler.toml is gitignored upstream (it carries private
+          # resource ids). Rebuild it from the committed template on every
+          # run so the deploy target is fully described by repo variables.
+          cp worker/wrangler.toml.example worker/wrangler.toml
+          sed -i \
+            -e "s|^name = \"edgesonic\"|name = \"${WORKER_NAME}\"|" \
+            -e "s|<YOUR_CLOUDFLARE_ACCOUNT_ID>|${CLOUDFLARE_ACCOUNT_ID}|g" \
+            -e "s|<YOUR_D1_DATABASE_ID>|${DB_ID}|g" \
+            -e "s|^database_name = \"edgesonic-db\"|database_name = \"${DB_NAME}\"|" \
+            -e "s|<YOUR_R2_BUCKET_NAME>|${R2_BUCKET}|g" \
+            -e "s|<GENERATE_A_UUID>|${INSTANCE_ID}|g" \
+            -e "s|<your-domain.example.com>|${SITE_DOMAIN}|g" \
+            worker/wrangler.toml
+
+          # The account is on the Workers Free plan, where `[[containers]]`
+          # (Server-side ffmpeg transcoding) cannot be deployed. Drop the
+          # container app together with its Sandbox Durable Object binding and
+          # migration — the three blocks are contiguous at the end of the
+          # template. Transcoding then runs in the browser work pool, which is
+          # the documented Free-plan behaviour.
+          sed -i '/^\[\[containers\]\]/,/^new_sqlite_classes/d' worker/wrangler.toml
+          if grep -qE '^\[\[(containers|durable_objects\.bindings|migrations)\]\]' worker/wrangler.toml; then
+            echo "::error::wrangler.toml still declares a container/Durable Object stack."
+            exit 1
+          fi
+
+          if grep -nE '<(YOUR_|GENERATE_|your-domain)' worker/wrangler.toml; then
+            echo "::error::Unsubstituted placeholders remain in worker/wrangler.toml."
+            exit 1
+          fi
+
+          echo "--- generated worker/wrangler.toml ---"
+          cat worker/wrangler.toml
+
+      - name: Apply D1 schema
+        run: |
+          set -euo pipefail
+          # Schema.sql is idempotent (CREATE IF NOT EXISTS / INSERT OR IGNORE),
+          # so re-applying it never clobbers library data or feature settings.
+          npx wrangler d1 execute "$DB_NAME" --remote \
+            --config worker/wrangler.toml \
+            --file worker/migrations/Schema.sql
+
+      - name: Deploy Worker
+        id: deploy
+        run: |
+          set -euo pipefail
+          BUILD_INFO=$(cat web/dist/build-info.json)
+          node -e 'const v=JSON.parse(process.argv[1]); if (!v.version || !v.buildTime || Number.isNaN(Date.parse(v.buildTime))) process.exit(1)' "$BUILD_INFO"
+          VERSION=$(node -e 'console.log(JSON.parse(process.argv[1]).version)' "$BUILD_INFO")
+          BUILD_TIME=$(node -e 'console.log(JSON.parse(process.argv[1]).buildTime)' "$BUILD_INFO")
+          echo "version=$VERSION buildTime=$BUILD_TIME"
+
+          # --containers-rollout=none keeps the deploy from trying to build the
+          # (already stripped) transcoder image with Docker.
+          npx wrangler deploy \
+            --config worker/wrangler.toml \
+            --containers-rollout=none \
+            --var WORKER_VERSION:"$VERSION" \
+            --var EDGESONIC_VERSION:"$VERSION" \
+            --var EDGESONIC_BUILD_TIME:"$BUILD_TIME"
+
+      - name: Sync Worker secrets
+        run: |
+          set -euo pipefail
+          SECRETS_FILE="$(mktemp)"
+          trap 'rm -f "$SECRETS_FILE"' EXIT
+          # Built with jq so token values are JSON-escaped, never interpolated
+          # into shell or YAML.
+          jq -n \
+            --arg workHmac "$S_WORK_HMAC" \
+            --arg accountId "$CLOUDFLARE_ACCOUNT_ID" \
+            --arg cfToken "$S_CF_API_TOKEN" \
+            --arg r2KeyId "$S_R2_KEY_ID" \
+            --arg r2Secret "$S_R2_SECRET" \
+            '{
+               WORK_UPLOAD_HMAC_KEY: $workHmac,
+               CF_ACCOUNT_ID: $accountId,
+               CF_API_TOKEN: $cfToken,
+               R2_ACCESS_KEY_ID: $r2KeyId,
+               R2_SECRET_ACCESS_KEY: $r2Secret
+             }' > "$SECRETS_FILE"
+
+          # One bulk call instead of five `secret put` calls — each of those
+          # would create its own Worker version.
+          if npx wrangler secret bulk "$SECRETS_FILE" --config worker/wrangler.toml; then
+            echo "Worker secrets synced via bulk upload."
+          else
+            echo "::warning::Bulk secret upload failed; falling back to individual puts."
+            printf '%s' "$S_WORK_HMAC" | npx wrangler secret put WORK_UPLOAD_HMAC_KEY --config worker/wrangler.toml
+            printf '%s' "$CLOUDFLARE_ACCOUNT_ID" | npx wrangler secret put CF_ACCOUNT_ID --config worker/wrangler.toml
+            printf '%s' "$S_CF_API_TOKEN" | npx wrangler secret put CF_API_TOKEN --config worker/wrangler.toml
+            printf '%s' "$S_R2_KEY_ID" | npx wrangler secret put R2_ACCESS_KEY_ID --config worker/wrangler.toml
+            printf '%s' "$S_R2_SECRET" | npx wrangler secret put R2_SECRET_ACCESS_KEY --config worker/wrangler.toml
+          fi
+
+      - name: Restore hourly cron trigger
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # wrangler deploy clears the runtime-managed schedule list. The app
+          # can restore the default from Settings -> Cloudflare ("Ensure
+          # default cron"); doing it here keeps every deploy self-contained.
+          # Default schedule: 0 */1 * * * (podcast refresh, WebDAV auto-scan,
+          # stale work reclaim).
+          RESP=$(curl -sS -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/schedules" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data '[{"cron":"0 */1 * * *"}]')
+          echo "$RESP" | jq -e '.success == true' >/dev/null \
+            && echo "Cron restored: 0 */1 * * *" \
+            || echo "::warning::Could not restore cron schedule: $RESP"
+
+      - name: Smoke test
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          SUBDOMAIN=$(curl -sS -m 20 \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/subdomain" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            | jq -r '.result.subdomain // empty')
+
+          URLS=("https://${SITE_DOMAIN}/")
+          if [ -n "$SUBDOMAIN" ]; then
+            URLS+=("https://${WORKER_NAME}.${SUBDOMAIN}.workers.dev/")
+          fi
+
+          for url in "${URLS[@]}"; do
+            echo "--- $url"
+            for attempt in $(seq 1 15); do
+              CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 20 "$url" || true)
+              if [ "$CODE" = "200" ]; then
+                echo "$url -> 200"
+                break
+              fi
+              echo "$url -> $CODE (attempt $attempt)"
+              sleep 4
+            done
+          done
+          # The version endpoint proves the freshly built Worker is live.
+          echo "--- version endpoint"
+          curl -s -m 20 "https://${SITE_DOMAIN}/edgesonic/version" || true
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "## EdgeSonic deploy"
+            echo ""
+            echo "- Worker: \`${WORKER_NAME}\`"
+            echo "- URL: https://${SITE_DOMAIN}/"
+            echo "- D1: \`${DB_NAME}\` (\`${DB_ID}\`)"
+            echo "- R2: \`${R2_BUCKET}\`"
+            echo "- Commit: \`${GITHUB_SHA::10}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
